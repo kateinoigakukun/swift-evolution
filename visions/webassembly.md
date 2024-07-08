@@ -125,3 +125,41 @@ header using the Clang version of attributes.
 is the counterpart of `@_extern(wasm)` working in the opposite direction. This explicitly makes a Swift declaration
 available outside of the current module, added to its exports section under a given name. Again, the lack of
 this attribute in Swift requires use of C headers as a workaround.
+
+## Platform-specific Considerations
+
+### Debugging
+
+Debugging Wasm modules is a challenging task because a debugger cannot be built on top of the Wasm, as it does not expose ways to introspect and control the execution of the Wasm instance.
+
+なので、デバッガはWasm実行エンジン側の特別なサポートが必要。
+
+The current state of debugging tools in the Wasm ecosystem is not as mature as other platforms but there are two
+directions that can be explored to improve the situation:
+
+1. LLDB debugger with a Wasm runtime supporting GDB Remote Serial Protocol.
+2. A Wasm runtime with a built-in debugger
+
+The first approach は既存のデバッグワークフローとほぼ同等の体験を提供できる。リモートのメタデータ情報やシリアライズされたモジュール情報を使ったLLDBのSwiftサポートをほぼそのまま利用できる。ただし、Wasmがハーバードアーキテクチャであり、ユーザスペースでJITを実装することが難しいため、JITが必要な式の評価を使うためにはWasmエンジン側のgdb stubにトリッキーな実装か、GDB Remote Serial Protocolの拡張が必要。
+
+The second approach はWasmエンジン側にデバッガを組み込む方針で、Web browserなどWasmエンジンが別の言語エンジンに埋め込まれている場合、ホスト側のデバッガと連携してシームレスなデバッグ体験を提供できる。例えば、JavaScriptとWasmのコールフレームがインターリーブしている場合でも、デバッガはどちらのコンテキストでも正しく動作する。Chrome DevToolsのようなデバッグツールは、Wasmに埋め込まれた（もしくは別ファイルとして配布された）DWARF情報を使ってデバッグ情報を提供できる [^devtools]。ただし、DWARF ExpressionsやLLDB Summary Stringsで表現できない、Swift固有のリフレクション情報が必要な型のフォーマットや、JITを必要とする式の評価をサポートするためには、これらのデバッガにLLDBのSwiftプラグインを何かしらの形で連携させる必要がある。
+
+両方の方式でDWARF ExpressionsやLLDB Summary Stringsが使えることを考えると、Swiftツールチェインとしてはコンパイラが静的に生成できるものに関しては出来る限りDWARF情報を生成することが望ましい。また、現状LLDBのSwiftプラグインが前提となったDWARF情報が生成されるため（たとえば、`Swift.Int`型に関するエントリは`DW_AT_encoding`を持たない`DW_TAG_structure_type`ノードであるため、`Swift.Int`を知らないデバッグツールは`Int`型の値を正しく表示できない）、Swiftの型情報を出来る限りDWARF-friendlyにすることも望ましいだろう。
+
+[^devtools]: https://github.com/ChromeDevTools/devtools-frontend/blob/main/extensions/cxx_debugging
+
+### Multi-threading and Concurrency
+
+WebAssembly has atomic operations in the instruction set (only sequential consistency is supported), but it does not have a built-in way to create threads. Instead, it relies on the host environment to provide multi-threading support. This means that multi-threading in Wasm is dependent on the Wasm runtime that executes the module. There are two proposals to standardize ways to create threads in Wasm: [wasi-threads](https://github.com/WebAssembly/wasi-threads), which is already supported by some toolchains, runtimes, and libraries but has been superseded by the new one. The new proposal [shared-everything-threads](https://github.com/WebAssembly/shared-everything-threads) is still in the early stages of spec development but is expected to be the future of multi-threading in Wasm.
+
+In the context of Swift, currently two threading models are supported: single threaded (`wasm32-unknown-wasi`) and wasi-threads based multi-threaded (`wasm32-unknown-wasip1-threads`). Even though the latter supports multi-threading, we use cooperative single-threaded executor as the default global executor in Swift Concurrency due to the lack of libdispatch support. Considering the future of multi-threading in Wasm, we should prepare for the shared-everything-threads proposal and make sure that Swift Concurrency can be built on top of it.
+
+### 64-bit address space
+
+The current de-facto standard address space size for WebAssembly is 32-bit, but the WebAssembly specification is going to support [64-bit address space](https://github.com/WebAssembly/memory64/). Swift already has support for 64-bit for other platforms, however, WebAssembly is the first platform where relative reference from data to code is not allowed and the alternative solutions (e.g. image-base relative addressing or small "code model") to fit 64-bit pointer in 32-bit are not available, at least for now. This means that we need cooperation from the WebAssembly toolchain side or different memory layout in Swift metadata to support 64-bit in WebAssembly.
+
+### Shared libraries
+
+There are two approaches to consuming shared libraries in WebAssembly ecosystem: [Emscripten-style dynamic linking](https://emscripten.org/docs/compiling/Dynamic-Linking.html) and [Component Model-based "ahead-of-time" linking](https://github.com/WebAssembly/component-model/blob/main/design/mvp/Linking.md). Emscripten-style dynamic linking is a traditional way to use shared libraries in WebAssembly, where the host environment provides non-standard dynamic loading capabilities. Component Model-based AOT linking is a new way that transforms shared library WebAssembly Core modules compiled with [Emscripten's dynamic linking ABI](https://github.com/WebAssembly/tool-conventions/blob/main/DynamicLinking.md) into a single WebAssembly Component at build time. The latter approach cannot fully replace the former, as it is not able to handle dynamic loading of shared libraries at runtime, but it is more portable way to distribute programs linked with shared libraries because it does not require the host environment to provide any special capabilities except for Component Model support.
+
+From the Swift toolchain perspective, they both use the Emscripten's dynamic linking ABI, so the support for shared libraries in Swift is mostly about making sure that Swift programs can be compiled in position-independent code mode and linked with shared libraries by following the dynamic linking ABI.
